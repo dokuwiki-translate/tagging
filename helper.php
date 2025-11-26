@@ -1,6 +1,7 @@
 <?php
 
 use dokuwiki\Extension\Plugin;
+use dokuwiki\Logger;
 use dokuwiki\Utf8\PhpString;
 use dokuwiki\Form\Form;
 use dokuwiki\Search\Indexer;
@@ -151,7 +152,7 @@ class helper_plugin_tagging extends Plugin
         }
 
         $db = $this->getDB();
-        $db->query('BEGIN TRANSACTION');
+        $db->exec('BEGIN TRANSACTION');
 
         $queries = [['DELETE FROM taggings WHERE pid = ? AND tagger = ?', $id, $user]];
         foreach ($tags as $tag) {
@@ -162,13 +163,13 @@ class helper_plugin_tagging extends Plugin
             try {
                 call_user_func_array([$db, 'exec'], $query);
             } catch (\PDOException $e) {
-                \dokuwiki\Logger::error("Tagging: replacing tag failed - " . $e->getMessage());
-                $db->query('ROLLBACK TRANSACTION');
+                Logger::error("Tagging: replacing tag failed - " . $e->getMessage());
+                $db->exec('ROLLBACK TRANSACTION');
                 return;
             }
         }
 
-        $db->query('COMMIT TRANSACTION');
+        $db->exec('COMMIT TRANSACTION');
     }
 
     /**
@@ -494,7 +495,7 @@ class helper_plugin_tagging extends Plugin
         $where .= ' AND GETACCESSLEVEL(pid) >= ' . AUTH_EDIT;
         $where .= $queryTagger;
 
-        $db->query('BEGIN TRANSACTION');
+        $db->exec('BEGIN TRANSACTION');
 
         // insert new tags first
         foreach ($newTagNames as $newTag) {
@@ -508,8 +509,8 @@ class helper_plugin_tagging extends Plugin
             try {
                 $db->exec($insertQuery . $where, $params);
             } catch (\PDOException $e) {
-                \dokuwiki\Logger::error("Tagging: renaming tag $formerTagName failed - " . $e->getMessage());
-                $db->query('ROLLBACK TRANSACTION');
+                Logger::error("Tagging: renaming tag $formerTagName failed - " . $e->getMessage());
+                $db->exec('ROLLBACK TRANSACTION');
                 return;
             }
         }
@@ -522,13 +523,13 @@ class helper_plugin_tagging extends Plugin
             try {
                 $db->exec($deleteQuery . $where, $params);
             } catch (\PDOException $e) {
-                \dokuwiki\Logger::error("Tagging: renaming tag $formerTagName failed - " . $e->getMessage());
-                $db->query('ROLLBACK TRANSACTION');
+                Logger::error("Tagging: renaming tag $formerTagName failed - " . $e->getMessage());
+                $db->exec('ROLLBACK TRANSACTION');
                 return;
             }
         }
 
-        $db->query('COMMIT TRANSACTION');
+        $db->exec('COMMIT TRANSACTION');
 
         msg($this->getLang("admin renamed"), 1);
     }
@@ -557,13 +558,13 @@ class helper_plugin_tagging extends Plugin
         }
 
         if (empty($newTagName)) {
-            $db->query(
+            $db->exec(
                 'DELETE FROM taggings WHERE pid = ? AND CLEANTAG(tag) = ?',
                 $pid,
                 $this->cleanTag($formerTagName)
             );
         } else {
-            $db->query(
+            $db->exec(
                 'UPDATE taggings SET tag = ? WHERE pid = ? AND CLEANTAG(tag) = ?',
                 $newTagName,
                 $pid,
@@ -605,7 +606,7 @@ class helper_plugin_tagging extends Plugin
         $numAffectedPages = $db->exec($affectedPagesQuery, $args);
 
         $deleteQuery = 'DELETE ' . $queryBody;
-        $db->query($deleteQuery, $args);
+        $db->exec($deleteQuery, $args);
 
         msg(sprintf($this->getLang("admin deleted"), count($tags), $numAffectedPages), 1);
     }
@@ -619,7 +620,7 @@ class helper_plugin_tagging extends Plugin
         $query = 'DELETE    FROM "taggings"
                             WHERE NOT PAGEEXISTS(pid)
                  ';
-        $db->query($query);
+        $db->exec($query);
     }
 
     /**
@@ -631,7 +632,7 @@ class helper_plugin_tagging extends Plugin
     public function renamePage($oldName, $newName)
     {
         $db = $this->getDB();
-        $db->query('UPDATE taggings SET pid = ? WHERE pid = ?', $newName, $oldName);
+        $db->exec('UPDATE taggings SET pid = ? WHERE pid = ?', $newName, $oldName);
     }
 
     /**
