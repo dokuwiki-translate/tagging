@@ -1,13 +1,15 @@
 <?php
 
 use dokuwiki\Extension\Plugin;
+use dokuwiki\Logger;
 use dokuwiki\Utf8\PhpString;
 use dokuwiki\Form\Form;
 use dokuwiki\Search\Indexer;
 use dokuwiki\File\PageResolver;
+use dokuwiki\plugin\sqlite\SQLiteDB;
 
 /**
- * Tagging Plugin (hlper component)
+ * Tagging Plugin (helper component)
  *
  * @license GPL 2
  */
@@ -15,10 +17,10 @@ class helper_plugin_tagging extends Plugin
 {
     /**
      * Gives access to the database
+     * Initializes SQLite and registers custom functions
      *
-     * Initializes the SQLite helper and register the CLEANTAG function
-     *
-     * @return helper_plugin_sqlite|bool false if initialization fails
+     * @return SQLiteDB|null
+     * @throws Exception
      */
     public function getDB()
     {
@@ -27,16 +29,12 @@ class helper_plugin_tagging extends Plugin
             return $db;
         }
 
-        /** @var helper_plugin_sqlite $db */
-        $db = plugin_load('helper', 'sqlite');
-        if ($db === null) {
-            msg('The tagging plugin needs the sqlite plugin', -1);
 
-            return false;
-        }
-        $db->init('tagging', __DIR__ . '/db/');
-        $db->create_function('CLEANTAG', [$this, 'cleanTag'], 1);
-        $db->create_function(
+        if (!class_exists(SQLiteDB::class)) throw new Exception('SQLite Plugin missing');
+        $db = new SQLiteDB('tagging', __DIR__ . '/db/');
+
+        $db->getPdo()->sqliteCreateFunction('CLEANTAG', [$this, 'cleanTag'], 1);
+        $db->getPdo()->sqliteCreateFunction(
             'GROUP_SORT',
             function ($group, $newDelimiter) {
                 $ex = array_filter(explode(',', $group));
@@ -46,7 +44,7 @@ class helper_plugin_tagging extends Plugin
             },
             2
         );
-        $db->create_function('GET_NS', 'getNS', 1);
+        $db->getPdo()->sqliteCreateFunction('GET_NS', 'getNS', 1);
 
         return $db;
     }
@@ -129,7 +127,7 @@ class helper_plugin_tagging extends Plugin
      */
     public function globNamespace($namespace)
     {
-        return cleanId($namespace) . '*';
+        return cleanID($namespace) . '*';
     }
 
     /**
@@ -141,7 +139,6 @@ class helper_plugin_tagging extends Plugin
      * @param string $user
      * @param array  $tags
      *
-     * @return bool|SQLiteResult
      */
     public function replaceTags($id, $user, $tags)
     {
@@ -155,7 +152,7 @@ class helper_plugin_tagging extends Plugin
         }
 
         $db = $this->getDB();
-        $db->query('BEGIN TRANSACTION');
+        $db->exec('BEGIN TRANSACTION');
 
         $queries = [['DELETE FROM taggings WHERE pid = ? AND tagger = ?', $id, $user]];
         foreach ($tags as $tag) {
@@ -163,14 +160,16 @@ class helper_plugin_tagging extends Plugin
         }
 
         foreach ($queries as $query) {
-            if (!call_user_func_array([$db, 'query'], $query)) {
-                $db->query('ROLLBACK TRANSACTION');
-
-                return false;
+            try {
+                call_user_func_array([$db, 'exec'], $query);
+            } catch (\PDOException $e) {
+                Logger::error("Tagging: replacing tag failed - " . $e->getMessage());
+                $db->exec('ROLLBACK TRANSACTION');
+                return;
             }
         }
 
-        return $db->query('COMMIT TRANSACTION');
+        $db->exec('COMMIT TRANSACTION');
     }
 
     /**
@@ -438,9 +437,7 @@ class helper_plugin_tagging extends Plugin
         }
 
         array_unshift($params, $this->globNamespace($namespace));
-        $res = $db->query($query, $params);
-
-        return $db->res2arr($res);
+        return $db->queryAll($query, $params);
     }
 
     /**
@@ -455,11 +452,10 @@ class helper_plugin_tagging extends Plugin
         FROM taggings
         GROUP BY pid
         ';
-        $db = $this->getDb();
-        $res = $db->query($query);
+        $db = $this->getDB();
         return array_map(
             fn($i) => explode(',', $i),
-            array_column($db->res2arr($res), 'tags', 'pid')
+            array_column($db->queryAll($query), 'tags', 'pid')
         );
     }
 
@@ -499,7 +495,7 @@ class helper_plugin_tagging extends Plugin
         $where .= ' AND GETACCESSLEVEL(pid) >= ' . AUTH_EDIT;
         $where .= $queryTagger;
 
-        $db->query('BEGIN TRANSACTION');
+        $db->exec('BEGIN TRANSACTION');
 
         // insert new tags first
         foreach ($newTagNames as $newTag) {
@@ -509,12 +505,14 @@ class helper_plugin_tagging extends Plugin
             }
             $params = [$newTag, $this->cleanTag($formerTagName)];
             if ($tagger) $params[] = $tagger;
-            $res = $db->query($insertQuery . $where, $params);
-            if ($res === false) {
-                $db->query('ROLLBACK TRANSACTION');
+
+            try {
+                $db->exec($insertQuery . $where, $params);
+            } catch (\PDOException $e) {
+                Logger::error("Tagging: renaming tag $formerTagName failed - " . $e->getMessage());
+                $db->exec('ROLLBACK TRANSACTION');
                 return;
             }
-            $db->res_close($res);
         }
 
         // finally delete the renamed tags
@@ -522,13 +520,16 @@ class helper_plugin_tagging extends Plugin
             $deleteQuery = 'DELETE FROM taggings';
             $params = [$this->cleanTag($formerTagName)];
             if ($tagger) $params[] = $tagger;
-            if ($db->query($deleteQuery . $where, $params) === false) {
-                $db->query('ROLLBACK TRANSACTION');
+            try {
+                $db->exec($deleteQuery . $where, $params);
+            } catch (\PDOException $e) {
+                Logger::error("Tagging: renaming tag $formerTagName failed - " . $e->getMessage());
+                $db->exec('ROLLBACK TRANSACTION');
                 return;
             }
         }
 
-        $db->query('COMMIT TRANSACTION');
+        $db->exec('COMMIT TRANSACTION');
 
         msg($this->getLang("admin renamed"), 1);
     }
@@ -544,35 +545,32 @@ class helper_plugin_tagging extends Plugin
      */
     public function modifyPageTag($pid, $formerTagName, $newTagName)
     {
+        $db = $this->getDB();
 
-        $db = $this->getDb();
-
-        $res = $db->query(
+        $check = $db->queryAll(
             'SELECT pid FROM taggings WHERE CLEANTAG(tag) = ? AND pid = ?',
             $this->cleanTag($formerTagName),
             $pid
         );
-        $check = $db->res2arr($res);
 
         if (empty($check)) {
             return [true, $this->getLang('admin tag does not exists')];
         }
 
         if (empty($newTagName)) {
-            $res = $db->query(
+            $db->exec(
                 'DELETE FROM taggings WHERE pid = ? AND CLEANTAG(tag) = ?',
                 $pid,
                 $this->cleanTag($formerTagName)
             );
         } else {
-            $res = $db->query(
+            $db->exec(
                 'UPDATE taggings SET tag = ? WHERE pid = ? AND CLEANTAG(tag) = ?',
                 $newTagName,
                 $pid,
                 $this->cleanTag($formerTagName)
             );
         }
-        $db->res2arr($res);
 
         return [false, $this->getLang('admin renamed')];
     }
@@ -589,7 +587,7 @@ class helper_plugin_tagging extends Plugin
             return;
         }
 
-        $namespace = cleanId($namespace);
+        $namespace = cleanID($namespace);
 
         $db = $this->getDB();
 
@@ -605,11 +603,10 @@ class helper_plugin_tagging extends Plugin
         }
 
         $affectedPagesQuery = 'SELECT DISTINCT pid ' . $queryBody;
-        $resAffectedPages = $db->query($affectedPagesQuery, $args);
-        $numAffectedPages = count($resAffectedPages->fetchAll());
+        $numAffectedPages = $db->exec($affectedPagesQuery, $args);
 
         $deleteQuery = 'DELETE ' . $queryBody;
-        $db->query($deleteQuery, $args);
+        $db->exec($deleteQuery, $args);
 
         msg(sprintf($this->getLang("admin deleted"), count($tags), $numAffectedPages), 1);
     }
@@ -623,8 +620,7 @@ class helper_plugin_tagging extends Plugin
         $query = 'DELETE    FROM "taggings"
                             WHERE NOT PAGEEXISTS(pid)
                  ';
-        $res = $db->query($query);
-        $db->res_close($res);
+        $db->exec($query);
     }
 
     /**
@@ -636,7 +632,7 @@ class helper_plugin_tagging extends Plugin
     public function renamePage($oldName, $newName)
     {
         $db = $this->getDB();
-        $db->query('UPDATE taggings SET pid = ? WHERE pid = ?', $newName, $oldName);
+        $db->exec('UPDATE taggings SET pid = ? WHERE pid = ?', $newName, $oldName);
     }
 
     /**
@@ -715,8 +711,7 @@ class helper_plugin_tagging extends Plugin
 
         $db = $this->getDB();
         $sql = 'SELECT pid from taggings where CLEANTAG(tag) = CLEANTAG(?)';
-        $res =  $db->query($sql, $tid);
-        $pages = $db->res2arr($res);
+        $pages =  $db->queryAll($sql, $tid);
 
         if ($pages) {
             $html .= '<ul>';
@@ -997,8 +992,7 @@ class helper_plugin_tagging extends Plugin
             return [];
         }
 
-        $res = $db->query($query[0], $query[1]);
-        $res = $db->res2arr($res);
+        $res = $db->queryAll($query[0], $query[1]);
 
         $ret = [];
         foreach ($res as $row) {
@@ -1044,7 +1038,7 @@ class helper_plugin_tagging extends Plugin
                             WHERE NOT PAGEEXISTS(pid)
                             GROUP BY pid
                  ';
-        $res = $db->query($query);
-        return $db->res2arr($res);
+
+        return $db->queryAll($query);
     }
 }
